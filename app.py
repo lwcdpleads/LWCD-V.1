@@ -7,16 +7,39 @@ from pypdf import PdfReader, PdfWriter
 from docx import Document
 
 DB="score_engine.db"
-st.set_page_config(page_title="PLEADS SCORE ENGINE V2",page_icon="📊",layout="wide")
+st.set_page_config(page_title="PLEADS SCORE ENGINE V3",page_icon="📊",layout="wide")
 
 def db():
     con=sqlite3.connect(DB); con.row_factory=sqlite3.Row
+    con.execute("PRAGMA foreign_keys=ON")
     con.executescript("""
     CREATE TABLE IF NOT EXISTS projects(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS uploads(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id INTEGER,filename TEXT,sha256 TEXT UNIQUE,judge TEXT,uploaded_at TEXT,raw BLOB,analysis_json TEXT);
-    CREATE TABLE IF NOT EXISTS verifications(project_id INTEGER,team TEXT,status TEXT DEFAULT 'Pending',note TEXT DEFAULT '',updated_at TEXT,PRIMARY KEY(project_id,team));
+    CREATE TABLE IF NOT EXISTS uploads(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id INTEGER,filename TEXT,sha256 TEXT,judge TEXT,uploaded_at TEXT,raw BLOB,analysis_json TEXT,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE);
+    CREATE TABLE IF NOT EXISTS verifications(project_id INTEGER,team TEXT,status TEXT DEFAULT 'Pending',note TEXT DEFAULT '',updated_at TEXT,
+        PRIMARY KEY(project_id,team), FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE);
     """)
+    # Migrate old V2 schema: sha256 used to be globally UNIQUE, which made the
+    # same PDF impossible to upload into a fresh project. Rebuild uploads so
+    # duplicates are scoped to the selected project only.
+    cols=[r[1] for r in con.execute("PRAGMA table_info(uploads)").fetchall()]
+    indexes=con.execute("PRAGMA index_list(uploads)").fetchall()
+    has_unique_sha=False
+    for ix in indexes:
+        if ix[2]:
+            info=con.execute(f'PRAGMA index_info("{ix[1]}")').fetchall()
+            if [x[2] for x in info]==['sha256']: has_unique_sha=True
+    if has_unique_sha:
+        con.execute("ALTER TABLE uploads RENAME TO uploads_old")
+        con.execute("""CREATE TABLE uploads(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id INTEGER,filename TEXT,sha256 TEXT,judge TEXT,uploaded_at TEXT,raw BLOB,analysis_json TEXT,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE)""")
+        con.execute("""INSERT INTO uploads(id,project_id,filename,sha256,judge,uploaded_at,raw,analysis_json)
+                      SELECT id,project_id,filename,sha256,judge,uploaded_at,raw,analysis_json FROM uploads_old""")
+        con.execute("DROP TABLE uploads_old")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_uploads_project_sha ON uploads(project_id,sha256)")
+    con.commit()
     return con
+
 con=db()
 
 def clean(s): return re.sub(r"\s+"," ",(s or "").replace("\u00a0"," ")).strip()
@@ -176,7 +199,7 @@ def validation(analyses,expected):
             if extra: issues.append(("warning",a["filename"],"Tim ekstra/beda nama: "+", ".join(sorted(extra))))
     return issues
 
-st.markdown("# 📊 PLEADS SCORE ENGINE V2")
+st.markdown("# 📊 PLEADS SCORE ENGINE V3")
 st.caption("Upload → auto-detect → check → pisah → gabung → verifikasi → publication gate")
 
 with st.sidebar:
@@ -190,6 +213,17 @@ with st.sidebar:
             con.execute("INSERT INTO projects(name,created_at) VALUES(?,?)",(nm.strip(),datetime.now().isoformat())); con.commit(); st.rerun()
         pid=None
     else: pid=int(choice.split(" — ",1)[0])
+    if pid:
+        st.divider()
+        with st.expander("🗑️ Hapus project",expanded=False):
+            selected_name=con.execute("SELECT name FROM projects WHERE id=?",(pid,)).fetchone()["name"]
+            st.warning(f"Project **{selected_name}** beserta seluruh file penilaian dan data verifikasinya akan dihapus permanen.")
+            confirm_delete=st.checkbox("Saya paham dan ingin menghapus project ini",key=f"confirm_delete_{pid}")
+            if st.button("🗑️ Hapus project permanen",type="secondary",disabled=not confirm_delete,key=f"delete_project_{pid}"):
+                con.execute("DELETE FROM projects WHERE id=?",(pid,))
+                con.commit()
+                st.success("Project berhasil dihapus.")
+                st.rerun()
     st.divider(); st.subheader("Alias nama tim")
     ar=st.text_area("salah = benar",placeholder="Karl Max = Karl Marx")
     aliases={}
@@ -209,14 +243,29 @@ tabs=st.tabs(["1 · UPLOAD","2 · CHECK","3 · PISAH","4 · GABUNG","5 · VERIFI
 
 with tabs[0]:
     fs=st.file_uploader("Upload satu atau banyak PDF",type="pdf",accept_multiple_files=True)
+    force_reanalyze=st.checkbox("♻️ Jika file sudah ada, analisis ulang dan ganti hasil lama",value=False)
     if fs and st.button("🔍 Analisis & simpan",type="primary"):
+        added=0; replaced=0; skipped=0
         for f in fs:
             b=f.getvalue(); h=filehash(b)
-            if con.execute("SELECT 1 FROM uploads WHERE sha256=?",(h,)).fetchone():
-                st.warning("Skip duplikat: "+f.name); continue
+            old=con.execute("SELECT id FROM uploads WHERE project_id=? AND sha256=?",(pid,h)).fetchone()
+            if old:
+                if force_reanalyze:
+                    a=analyze(b,f.name,aliases)
+                    con.execute("UPDATE uploads SET filename=?,judge=?,uploaded_at=?,raw=?,analysis_json=? WHERE id=?",
+                                 (f.name,a["judge"],datetime.now().isoformat(),b,json.dumps(a,ensure_ascii=False),old["id"]))
+                    replaced+=1
+                else:
+                    st.warning("Skip duplikat dalam project ini: "+f.name+" — centang ♻️ untuk analisis ulang.")
+                    skipped+=1
+                continue
             a=analyze(b,f.name,aliases)
-            con.execute("INSERT INTO uploads(project_id,filename,sha256,judge,uploaded_at,raw,analysis_json) VALUES(?,?,?,?,?,?,?)",(pid,f.name,h,a["judge"],datetime.now().isoformat(),b,json.dumps(a,ensure_ascii=False)))
-        con.commit(); st.success("Selesai."); st.rerun()
+            con.execute("INSERT INTO uploads(project_id,filename,sha256,judge,uploaded_at,raw,analysis_json) VALUES(?,?,?,?,?,?,?)",
+                        (pid,f.name,h,a["judge"],datetime.now().isoformat(),b,json.dumps(a,ensure_ascii=False)))
+            added+=1
+        con.commit()
+        st.success(f"Selesai — {added} file baru, {replaced} dianalisis ulang, {skipped} dilewati.")
+        st.rerun()
     st.dataframe([{"File":x["filename"],"Juri":x["judge"] or "⚠️ belum terdeteksi"} for x in ups],use_container_width=True,hide_index=True)
 
 with tabs[1]:
