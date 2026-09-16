@@ -31,59 +31,86 @@ def filehash(b): return hashlib.sha256(b).hexdigest()
 
 def pages_text(data):
     r=PdfReader(io.BytesIO(data))
-    return [clean(p.extract_text() or "") for p in r.pages]
+    return ["\n".join(clean(x) for x in (p.extract_text() or "").splitlines() if clean(x)) for p in r.pages]
 
 def detect_judge(text,filename):
-    for pat in [r"(?im)^\s*juri\s*:\s*(.+)$",r"(?im)\bjuri\s*[:\-]\s*([^\n]+)"]:
+    # The completed PDF often has a blank Juri field; filename is the reliable
+    # source in this workflow: [Yasin] ..., [Marcell] ..., etc.
+    for pat in [r"(?im)\bjuri\s*:\s*([^\n]+)", r"(?im)\bjuri\s*[-:]\s*([^\n]+)"]:
         m=re.search(pat,text)
-        if m and clean(m.group(1)) and clean(m.group(1)).lower() not in {"nama","-"}: return clean(m.group(1))
-    m=re.search(r"\(([^)]+)\)",Path(filename).stem)
+        if m:
+            val=clean(m.group(1))
+            val=re.split(r"\bJudul\s+Berkas\s*:",val,flags=re.I)[0].strip()
+            if val and val.lower() not in {"nama","-"}: return val
+    m=re.search(r"^\[([^\]]+)\]",Path(filename).stem)
+    if m: return clean(m.group(1))
+    m=re.search(r"^\(([^)]+)\)",Path(filename).stem)
     return clean(m.group(1)) if m else ""
 
 def team_for_page(text,previous,aliases):
-    m=re.search(r"(?im)\bnama\s*tim\s*:\s*(.+)$",text)
-    if m and clean(m.group(1)).lower() not in {"","-","nama tim"}: return canonical(m.group(1),aliases)
-    m=re.search(r"(?im)^\s*[Pp]\s*[-–]\s*(.+)$",text)
-    if m: return canonical(m.group(1),aliases)
-    m=re.search(r"(?m)^\s*\d+\s*[-–]\s+(.+)$",text)
-    if m and len(clean(m.group(1)))<100: return canonical(m.group(1),aliases)
+    lines=[clean(x) for x in text.splitlines() if clean(x)]
+    for i,line in enumerate(lines):
+        m=re.search(r"\bnama\s*tim\s*:\s*(.*)$",line,re.I)
+        if m:
+            val=clean(m.group(1))
+            # If the value is on the same extracted line, stop before boilerplate.
+            val=re.split(r"\bPenentuan\s+pemenang\b",val,flags=re.I)[0].strip()
+            if val.lower() not in {"","-","nama tim"}: return canonical(val,aliases)
+            # Some PDF extractors put the value on the next line.
+            if i+1<len(lines):
+                val=clean(lines[i+1])
+                if val and val.lower() not in {"-","nama tim"}: return canonical(val,aliases)
+    for line in lines:
+        m=re.search(r"^\s*[Pp]\s*[-–]\s*(.+)$",line)
+        if m: return canonical(m.group(1),aliases)
+        m=re.search(r"^\s*\d+\s*[-–]\s+(.+)$",line)
+        if m and len(clean(m.group(1)))<100: return canonical(m.group(1),aliases)
     return previous
 
 def schema(text):
+    lines=[clean(x) for x in text.splitlines() if clean(x)]
     out=[]; seen=set()
-    for line in [clean(x) for x in text.splitlines() if clean(x)]:
-        m=re.search(r"^(?:\d+\s+)?(.+?)\s+0\s*[-–]\s*(\d{2,4})$",line)
-        if m:
-            name=clean(m.group(1)); mx=int(m.group(2))
-            if len(name)>=3 and norm(name) not in {"total","aspek penilaian","bobot","skor"} and norm(name) not in seen:
-                out.append((name,mx)); seen.add(norm(name))
-    if not out:
-        lines=[clean(x) for x in text.splitlines() if clean(x)]
-        for i,line in enumerate(lines):
-            m=re.match(r"^(\d+)\s+(.+)$",line)
-            if not m: continue
-            for j in range(i+1,min(i+8,len(lines))):
-                sm=re.search(r"0\s*[-–]\s*(\d{2,4})$",lines[j])
-                if sm:
-                    name=clean(m.group(2))
-                    if norm(name) not in seen: out.append((name,int(sm.group(1)))); seen.add(norm(name))
-                    break
+    scale_re=re.compile(r"^0\s*[-–]\s*(\d{2,4})(?:\s+(\d{1,4}))?$")
+    for i,line in enumerate(lines):
+        m=scale_re.match(line)
+        if not m: continue
+        mx=int(m.group(1)); name=""
+        for j in range(i-1,max(-1,i-4),-1):
+            cand=clean(lines[j])
+            if re.fullmatch(r"\d+",cand) or cand.lower() in {"no. aspek penilaian skala skor","no aspek penilaian bobot skor"}: continue
+            # Aspect rows may contain their subcriteria on the same line.
+            cand=re.split(r"\s+(?=[a-z]{1,3}\.\s)",cand,maxsplit=1,flags=re.I)[0].strip()
+            if len(cand)>=3 and len(cand)<=100 and not re.search(r"(penentuan pemenang|lembar penilaian|komentar|total 1000)",cand,re.I):
+                name=re.sub(r"^\d+\s+", "", cand).strip(); break
+        if name and norm(name) not in seen and norm(name) not in {"aspek penilaian","skala","skor","bobot"}:
+            out.append((name,mx)); seen.add(norm(name))
     return out
 
 def scores(text,aspects):
     lines=[clean(x) for x in text.splitlines() if clean(x)]
-    vals={}
+    vals={}; scale_re=re.compile(r"^0\s*[-–]\s*(\d{2,4})(?:\s+(\d{1,4}))?$")
     for a,mx in aspects:
         for i,line in enumerate(lines):
             if norm(a) in norm(line):
-                c=[n for n in nums(line) if 0<=n<=mx]
-                if c: vals[a]=c[-1]; break
-                for j in range(i+1,min(i+4,len(lines))):
-                    c=[n for n in nums(lines[j]) if 0<=n<=mx]
-                    if c: vals[a]=c[-1]; break
+                for j in range(i+1,min(i+12,len(lines))):
+                    sm=scale_re.match(lines[j])
+                    if sm and int(sm.group(1))==mx:
+                        if sm.group(2) is not None: vals[a]=int(sm.group(2))
+                        else:
+                            for k in range(j+1,min(j+3,len(lines))):
+                                ns=[n for n in nums(lines[k]) if n<=mx]
+                                if ns: vals[a]=ns[-1]; break
+                        break
+                if a in vals: break
     total=None
-    m=re.search(r"(?im)\b(?:total|jumlah)\s*(?:nilai|skor)?\s*[:=]?\s*(\d{1,4})\b",text)
-    if m: total=int(m.group(1))
+    for i,line in enumerate(lines):
+        m=re.match(r"^total\s+1000(?:\s+(\d{1,4}))?",line,re.I)
+        if m:
+            if m.group(1) is not None: total=int(m.group(1))
+            else:
+                ns=[n for n in nums(line) if n!=1000]
+                if ns: total=ns[-1]
+            break
     return vals,total
 
 def comment(text):
@@ -95,11 +122,14 @@ def analyze(data,filename,aliases):
     for page,t in enumerate(ts,1):
         team=team_for_page(t,current,aliases)
         if team: current=team
-        marker=re.search(r"(?i)(lembar penilaian|aspek penilaian|nama tim|total\s*1000|total\s*nilai)",t)
-        if not marker: continue
+        # For the current LOC HUKOL workflow, only completed BERKAS scoring
+        # sheets count as records. Presentation sheets are a separate stage
+        # and may be blank, so they must not create false records.
+        is_berkas = bool(re.search(r"(?i)LEMBAR\s+PENILAIAN\s+BERKAS", t))
+        if not is_berkas: continue
         asp=schema(t); sc,total=scores(t,asp)
         if team and asp:
-            rec.append({"page":page,"team":team,"judge":judge,"aspects":asp,"scores":sc,"total":total,"comment":comment(t)})
+            rec.append({"page":page,"team":team,"judge":judge,"type":"berkas","aspects":asp,"scores":sc,"total":total,"comment":comment(t)})
     return {"filename":filename,"judge":judge,"pages":len(ts),"records":rec}
 
 def split_pdf(data,pages):
@@ -108,13 +138,11 @@ def split_pdf(data,pages):
     out=io.BytesIO(); w.write(out); return out.getvalue()
 
 def merge_pdfs(chunks):
-    """Merge PDF byte chunks using PdfWriter (pypdf 5+ compatible)."""
     w=PdfWriter()
     for _,b in chunks:
-        w.append(io.BytesIO(b))
-    out=io.BytesIO()
-    w.write(out)
-    return out.getvalue()
+        r=PdfReader(io.BytesIO(b))
+        for page in r.pages: w.add_page(page)
+    out=io.BytesIO(); w.write(out); return out.getvalue()
 
 def docx_recap(team,recs):
     d=Document(); d.add_heading(f"Rekap Penilaian — {team}",0)
