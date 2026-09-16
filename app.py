@@ -3,7 +3,7 @@ import io, re, hashlib, json, sqlite3
 from datetime import datetime
 from pathlib import Path
 import streamlit as st
-from pypdf import PdfReader, PdfWriter, PdfMerger
+from pypdf import PdfReader, PdfWriter
 from docx import Document
 
 DB="score_engine.db"
@@ -108,9 +108,13 @@ def split_pdf(data,pages):
     out=io.BytesIO(); w.write(out); return out.getvalue()
 
 def merge_pdfs(chunks):
-    m=PdfMerger()
-    for _,b in chunks: m.append(io.BytesIO(b))
-    out=io.BytesIO(); m.write(out); m.close(); return out.getvalue()
+    """Merge PDF byte chunks using PdfWriter (pypdf 5+ compatible)."""
+    w=PdfWriter()
+    for _,b in chunks:
+        w.append(io.BytesIO(b))
+    out=io.BytesIO()
+    w.write(out)
+    return out.getvalue()
 
 def docx_recap(team,recs):
     d=Document(); d.add_heading(f"Rekap Penilaian — {team}",0)
